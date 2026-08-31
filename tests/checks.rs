@@ -5,7 +5,7 @@
 //! verified against GNU Make 4.4.1.
 
 use make_lint::checks;
-use make_lint::diag::Diagnostic;
+use make_lint::diag::{Diagnostic, Severity};
 use make_lint::workspace::Workspace;
 
 use std::path::PathBuf;
@@ -49,7 +49,16 @@ impl Drop for Fixture {
     }
 }
 
+/// Codes the CLI would show by default: notes are hidden without --show-notes.
 fn codes(d: &[Diagnostic]) -> Vec<&str> {
+    let mut c: Vec<&str> =
+        d.iter().filter(|x| x.severity > Severity::Note).map(|x| x.code).collect();
+    c.sort_unstable();
+    c
+}
+
+/// Every code, notes included.
+fn all_codes(d: &[Diagnostic]) -> Vec<&str> {
     let mut c: Vec<&str> = d.iter().map(|x| x.code).collect();
     c.sort_unstable();
     c
@@ -59,7 +68,7 @@ fn codes(d: &[Diagnostic]) -> Vec<&str> {
 fn clean_makefile_is_silent() {
     let f = Fixture::new(&[(
         "Makefile",
-        "CC := gcc\nOBJS := $(patsubst %.c,%.o,$(SRCS))\n\n.PHONY: all\nall: $(OBJS)\n\t$(CC) -o $@ $^\n",
+        "CC := gcc\nSRCS :=\nOBJS := $(patsubst %.c,%.o,$(SRCS))\n\n.PHONY: all\nall: $(OBJS)\n\t$(CC) -o $@ $^\n",
     )]);
     assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
 }
@@ -72,7 +81,8 @@ fn bare_dollar_run_on_is_reported() {
 
 #[test]
 fn automatic_variables_are_not_reported() {
-    let f = Fixture::new(&[("Makefile", "all: a.c\n\tcp $< $@x\n\techo $^y $*z\n")]);
+    let f =
+        Fixture::new(&[("Makefile", "a.c:\n\ttouch $@\nall: a.c\n\tcp $< $@x\n\techo $^y $*z\n")]);
     assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
 }
 
@@ -87,7 +97,8 @@ fn space_in_variable_name_is_reported() {
 
 #[test]
 fn mistyped_function_suggests_the_real_one() {
-    let f = Fixture::new(&[("Makefile", "O := $(pastsubst %.c,%.o,$(S))\n")]);
+    let f =
+        Fixture::new(&[("Makefile", "S :=\nO := $(pastsubst %.c,%.o,$(S))\nall: ; @echo $(O)\n")]);
     let d = f.run("Makefile");
     assert_eq!(codes(&d), vec!["MK031"]);
     assert!(d[0].help.as_ref().unwrap().contains("patsubst"), "{:?}", d[0].help);
@@ -110,13 +121,28 @@ fn too_few_function_arguments_is_reported() {
     assert_eq!(codes(&f.run("Makefile")), vec!["MK032"]);
 }
 
+// A macro that simply does not exist here may come from a parent makefile, so
+// it is only a note. A near-miss of one that does exist is a warning.
 #[test]
-fn undefined_call_target_is_reported() {
+fn undefined_call_target_is_a_note() {
     let f = Fixture::new(&[(
         "Makefile",
         "define greet\necho hi\nendef\nall:\n\t@echo $(call greet)\n\t@echo $(call nope,x)\n",
     )]);
-    assert_eq!(codes(&f.run("Makefile")), vec!["MK030"]);
+    let d = f.run("Makefile");
+    assert_eq!(codes(&d), Vec::<&str>::new());
+    assert_eq!(all_codes(&d), vec!["MK030"]);
+}
+
+#[test]
+fn misspelled_call_target_is_a_warning() {
+    let f = Fixture::new(&[(
+        "Makefile",
+        "define install_thing\necho hi\nendef\nall:\n\t@echo $(call intsall_thing,x)\n",
+    )]);
+    let d = f.run("Makefile");
+    assert_eq!(codes(&d), vec!["MK030"]);
+    assert!(d[0].message.contains("install_thing`"), "{}", d[0].message);
 }
 
 #[test]
@@ -239,7 +265,7 @@ fn includes_are_followed_and_linted() {
 fn conditional_only_recipe_does_not_clash() {
     let f = Fixture::new(&[
         ("Makefile", "include lib.mk\n\nregister:\n\techo real\n"),
-        ("lib.mk", "register:\nifneq ($(A),$(B))\n\techo maybe\nendif\n"),
+        ("lib.mk", "A :=\nB :=\nregister:\nifneq ($(A),$(B))\n\techo maybe\nendif\n"),
     ]);
     assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
 }
@@ -271,4 +297,190 @@ fn include_of_a_remakeable_target_is_not_missing() {
 fn unresolved_include_suppresses_undefined_macro() {
     let f = Fixture::new(&[("Makefile", "-include gen.mk\nall:\n\t@echo $(call maybe_there,x)\n")]);
     assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+// ---------------------------------------------------------------------------
+// Value checks (phase 2)
+// ---------------------------------------------------------------------------
+
+// Similarity alone is not evidence: makefiles are full of deliberate families.
+// A warning needs both halves of the mistake visible — one name read and never
+// assigned, its near-twin assigned and never read.
+#[test]
+fn orphaned_misspelling_is_a_warning() {
+    let f = Fixture::new(&[("Makefile", "OUTPUT_DIR := build\nall:\n\t@echo $(OUPTUT_DIR)\n")]);
+    let d = f.run("Makefile");
+    assert_eq!(codes(&d), vec!["MK001"]);
+    assert!(d[0].message.contains("OUTPUT_DIR"), "{}", d[0].message);
+}
+
+#[test]
+fn a_name_that_is_used_elsewhere_is_not_a_typo_suggestion() {
+    // BUILD_IMAGE is read, so it is a real variable and BUILD_IMAGES is simply
+    // supplied from outside. Note, not warning.
+    let f = Fixture::new(&[(
+        "Makefile",
+        "BUILD_IMAGE := one\nall:\n\t@echo $(BUILD_IMAGE) $(BUILD_IMAGES)\n",
+    )]);
+    let d = f.run("Makefile");
+    assert_eq!(codes(&d), Vec::<&str>::new());
+    assert!(all_codes(&d).contains(&"MK001"));
+}
+
+#[test]
+fn plain_undefined_variable_is_a_note() {
+    let f = Fixture::new(&[("Makefile", "all:\n\t@echo $(GITHUB_TOKEN)\n")]);
+    let d = f.run("Makefile");
+    assert_eq!(codes(&d), Vec::<&str>::new());
+    assert_eq!(all_codes(&d), vec!["MK001"]);
+}
+
+#[test]
+fn unused_variable_is_reported_only_for_the_linted_file() {
+    let f = Fixture::new(&[
+        ("Makefile", "MINE := unused\nall:\n\t@echo hi\n"),
+        ("lib.mk", "THEIRS := also-unused\n"),
+    ]);
+    let d = f.run("Makefile");
+    let notes: Vec<&str> = d.iter().filter(|x| x.code == "MK002").map(|x| x.code).collect();
+    assert_eq!(notes, vec!["MK002"], "only the root's own variable");
+    assert!(d.iter().any(|x| x.code == "MK002" && x.message.contains("MINE")));
+}
+
+#[test]
+fn overwriting_an_unread_value_is_reported() {
+    let f = Fixture::new(&[("Makefile", "VER := 1\nVER := 2\nall:\n\t@echo $(VER)\n")]);
+    assert_eq!(codes(&f.run("Makefile")), vec!["MK003"]);
+}
+
+#[test]
+fn overwriting_after_a_read_is_fine() {
+    let f = Fixture::new(&[(
+        "Makefile",
+        "VER := 1\nTAG := v$(VER)\nVER := 2\nall:\n\t@echo $(TAG) $(VER)\n",
+    )]);
+    assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+// An override inside a conditional is the normal way to vary a value.
+#[test]
+fn conditional_override_is_not_a_clobber() {
+    let f = Fixture::new(&[(
+        "Makefile",
+        "VER := 1\nifdef RELEASE\nVER := 2\nendif\nall:\n\t@echo $(VER)\n",
+    )]);
+    assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+#[test]
+fn a_default_then_override_is_not_a_clobber() {
+    let f = Fixture::new(&[("Makefile", "VER ?= 1\nVER := 2\nall:\n\t@echo $(VER)\n")]);
+    assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+#[test]
+fn an_include_value_overwritten_by_the_includer_is_reported() {
+    let f = Fixture::new(&[
+        ("Makefile", "include lib.mk\nVER := 2\nall:\n\t@echo $(VER)\n"),
+        ("lib.mk", "VER := 1\n"),
+    ]);
+    assert_eq!(codes(&f.run("Makefile")), vec!["MK003"]);
+}
+
+#[test]
+fn deferred_shell_expanded_twice_is_reported() {
+    let f = Fixture::new(&[(
+        "Makefile",
+        "REV = $(shell git rev-parse HEAD)\nall:\n\t@echo $(REV)\n\t@echo $(REV)\n",
+    )]);
+    let d = f.run("Makefile");
+    assert_eq!(codes(&d), vec!["MK005"]);
+    assert!(d[0].message.contains("2 expansions"), "{}", d[0].message);
+}
+
+#[test]
+fn immediate_shell_is_fine() {
+    let f = Fixture::new(&[(
+        "Makefile",
+        "REV := $(shell git rev-parse HEAD)\nall:\n\t@echo $(REV)\n\t@echo $(REV)\n",
+    )]);
+    assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+#[test]
+fn deferred_shell_used_once_is_fine() {
+    let f =
+        Fixture::new(&[("Makefile", "REV = $(shell git rev-parse HEAD)\nall:\n\t@echo $(REV)\n")]);
+    assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+// make refuses this outright: "Recursive variable references itself".
+#[test]
+fn self_referential_recursive_variable_is_an_error() {
+    let f = Fixture::new(&[("Makefile", "CFLAGS = $(CFLAGS) -O2\nall:\n\t@echo $(CFLAGS)\n")]);
+    let d = f.run("Makefile");
+    assert_eq!(codes(&d), vec!["MK009"]);
+}
+
+#[test]
+fn simple_assignment_may_read_itself() {
+    let f = Fixture::new(&[(
+        "Makefile",
+        "CFLAGS := -g\nCFLAGS := $(CFLAGS) -O2\nall:\n\t@echo $(CFLAGS)\n",
+    )]);
+    assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+#[test]
+fn prerequisite_with_no_rule_and_no_file_is_reported() {
+    let f = Fixture::new(&[("Makefile", "all: missing/thing.txt\n\t@echo hi\n")]);
+    assert_eq!(codes(&f.run("Makefile")), vec!["MK021"]);
+}
+
+#[test]
+fn prerequisite_that_exists_is_fine() {
+    let f = Fixture::new(&[("Makefile", "all: there.txt\n\t@echo hi\n"), ("there.txt", "x")]);
+    assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+// A bare word is almost always a phony target, and a makefile meant to be
+// included expects its includer to define those.
+#[test]
+fn bare_word_prerequisite_is_not_judged() {
+    let f = Fixture::new(&[("Makefile", "test: ut fv st\n\t@echo hi\n")]);
+    assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+// make expands wildcards in prerequisites.
+#[test]
+fn glob_prerequisite_is_not_judged() {
+    let f = Fixture::new(&[("Makefile", "all: pkg/*.go\n\t@echo hi\n")]);
+    assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+// The target is only a name once the evaluator has expanded it.
+#[test]
+fn prerequisite_built_by_a_variable_target_is_fine() {
+    let f = Fixture::new(&[(
+        "Makefile",
+        "BIN := dist/bin\n$(BIN)/tool:\n\t@touch $@\nall: dist/bin/tool\n\t@echo hi\n",
+    )]);
+    assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+#[test]
+fn prerequisite_covered_by_a_pattern_rule_is_fine() {
+    let f = Fixture::new(&[(
+        "Makefile",
+        "%.pb.go: %.proto\n\t@touch $@\nall: api.pb.go\n\t@echo hi\n",
+    )]);
+    assert_eq!(codes(&f.run("Makefile")), Vec::<&str>::new());
+}
+
+#[test]
+fn append_before_any_definition_is_a_note() {
+    let f = Fixture::new(&[("Makefile", "MYLIST += one\nall:\n\t@echo $(MYLIST)\n")]);
+    let d = f.run("Makefile");
+    assert_eq!(codes(&d), Vec::<&str>::new());
+    assert!(all_codes(&d).contains(&"MK004"));
 }

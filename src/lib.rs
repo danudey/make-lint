@@ -8,11 +8,14 @@ pub mod ast;
 pub mod builtins;
 pub mod checks;
 pub mod diag;
+pub mod eval;
 pub mod expr;
+pub mod funcs;
 pub mod lexer;
 pub mod parser;
 pub mod render;
 pub mod span;
+pub mod value;
 pub mod workspace;
 
 /// Filenames GNU make looks for, in order.

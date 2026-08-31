@@ -173,3 +173,14 @@ fn resolve_include(
         }
     }
 }
+
+impl Workspace {
+    /// The directory make would run in: the first root makefile's directory.
+    /// Relative paths in prerequisites and `$(wildcard)` resolve against it.
+    pub fn base_dir(&self) -> PathBuf {
+        self.roots
+            .first()
+            .and_then(|&r| self.sources.get(r).path.parent().map(Path::to_path_buf))
+            .unwrap_or_default()
+    }
+}
