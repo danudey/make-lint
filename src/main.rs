@@ -22,6 +22,14 @@ OPTIONS:
         --fail-level <LEVEL> note, warning (default), or error
         --color <WHEN>       auto (default), always, or never
         --show-notes         Include note-level diagnostics in the output
+        --no-exec            Never run a $(shell ...) command
+        --allow-command <C>  Also run this command when it appears in
+                             $(shell ...) (repeatable)
+
+By default make-lint runs the $(shell ...) commands it can prove are read-only:
+an allowlist of plain commands with no redirection, no substitution, and path
+arguments confined to the project directory. Everything else is left unresolved
+and reported as MK040. Use --no-exec to run nothing at all.
     -h, --help               Print this help
     -V, --version            Print version
 
@@ -44,6 +52,8 @@ struct Args {
     fail_level: Severity,
     color: Option<bool>,
     show_notes: bool,
+    exec: make_lint::shell::Mode,
+    allow_commands: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -69,8 +79,10 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    let opts =
+        make_lint::eval::Options { exec: args.exec, allow_commands: args.allow_commands.clone() };
     let mut diags = std::mem::take(&mut ws.diags);
-    diags.extend(checks::run(&ws));
+    diags.extend(checks::run_with(&ws, &opts));
     if !args.show_notes {
         diags.retain(|d| d.severity > Severity::Note);
     }
@@ -103,6 +115,8 @@ fn parse_args() -> Result<Option<Args>, String> {
         fail_level: Severity::Warning,
         color: None,
         show_notes: false,
+        exec: make_lint::shell::Mode::Allowlist,
+        allow_commands: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     let mut positional = Vec::new();
@@ -123,6 +137,8 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-f" | "--file" => a.files.push(PathBuf::from(next("--file")?)),
             "-I" | "--include-dir" => a.include_dirs.push(PathBuf::from(next("--include-dir")?)),
             "--show-notes" => a.show_notes = true,
+            "--no-exec" => a.exec = make_lint::shell::Mode::Deny,
+            "--allow-command" => a.allow_commands.push(next("--allow-command")?),
             "--format" => {
                 a.format = match next("--format")?.as_str() {
                     "text" => Format::Text,

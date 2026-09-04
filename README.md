@@ -1,13 +1,14 @@
 # make-lint
 
-A static linter for GNU Makefiles. It parses and evaluates; it does not run
-your build, and it does not run `$(shell ...)`.
+A static linter for GNU Makefiles. It parses, evaluates, and runs only the
+`$(shell ...)` commands it can prove are read-only.
 
 ```
 cargo build --release
 ./target/release/make-lint              # lints ./Makefile and its includes
 ./target/release/make-lint --show-notes # include the quieter findings
 ./target/release/make-lint -f lib.mk --format json
+./target/release/make-lint --no-exec       # run no commands at all
 ```
 
 Exit code `0` when nothing at or above `--fail-level` (default `warning`) was
@@ -15,14 +16,15 @@ found, `1` when something was, `2` on a bad argument or unreadable file.
 
 ## Status
 
-Phases 1 to 3 of 5, with no dependencies.
+Phases 1 to 4 of 5, with no dependencies.
 
 * **Phase 1** — lexer, parser, and the checks that need syntax only.
 * **Phase 2** — the evaluator: make's variable table, built-in functions, and
   the checks that need values.
 * **Phase 3** — duplicate-value detection.
+* **Phase 4** — the `$(shell ...)` oracle.
 
-Still to come: the allowlisted `$(shell ...)` oracle (phase 4).
+Still to come: SARIF output, a config file, and suppression comments (phase 5).
 
 ## Checks
 
@@ -52,6 +54,7 @@ Notes are hidden unless `--show-notes` is passed.
 | MK035 | error | Unmatched `else` / `endif`, or a missing `endif` |
 | MK036 | error | Malformed `ifeq` / `ifdef` condition |
 | MK050 | warning | Non-optional `include` of a file that does not exist and is not a target |
+| MK040 | note | A `$(shell ...)` that was not run, and why |
 | MK098 | note | The file announces itself as generated, so advice about how it is written was suppressed |
 
 ## Design notes
@@ -119,6 +122,53 @@ but no advice about how it is written — the generator decides that, and the
 duplication in autoconf output is inherent to how it substitutes. MK098 says so
 rather than letting the run look clean.
 
+### Running commands without becoming a way to run commands
+
+A makefile may come from a third-party repository or an unreviewed pull request,
+so the gate is default-deny at every step:
+
+1. The command must already be fully expanded. What cannot be seen cannot be
+   vetted.
+2. It must be **recognised, not parsed**. A deliberately tiny grammar accepts a
+   pipeline of plain commands and nothing else — no redirection, no
+   substitution, no `;`, no globbing, no `~`, no environment prefix. Using a
+   real shell parser and then denying the dangerous parts gets this backwards;
+   anything the recogniser was never taught is refused because it was never
+   taught it.
+3. The program must be a **bare name** resolving inside a system directory, from
+   a fixed `PATH` rather than the caller's. `$(shell ./hack/gen.sh)` and
+   `$(shell bin/yq ...)` are repository-supplied executables and are refused —
+   running those is exactly the thing being avoided.
+4. It must be in the allowlist and satisfy that entry's argument policy:
+   `find -delete`, `sed -i`, `sort -o`, `git push` and `git ls-remote` are out,
+   and path arguments are confined to the project directory, so `cat VERSION`
+   works and `cat ~/.ssh/id_rsa` does not. Commands that only manipulate strings
+   (`basename`, `dirname`) have no paths to confine.
+5. Only then does it run: no stdin, no inherited environment, `LC_ALL=C`, a
+   two-second timeout, a 64 KiB output cap, and a budget across the whole run.
+
+`env`, `xargs`, `sudo`, `sh`, `awk` and `perl` are never allowed even if a user
+adds them: they exist to run something else, and the argument policy cannot see
+through them.
+
+There is no "run everything" switch. `--allow-command NAME` adds one command,
+still subject to confinement and the wrapper ban, which covers the real need
+without offering a way to execute an untrusted file wholesale.
+
+Refusals are not silent. MK040 names the command and the reason, so an unknown
+value is distinguishable from an empty one:
+
+```
+Makefile:12:14: note[MK040]: `$(shell curl https://example.com)` was not run:
+                             `curl` is not in the allowlist
+  = help: values derived from it stay unknown; `--allow-command NAME` permits it
+```
+
+Values carry how reproducible they are. `git` output is marked volatile, not
+merely filesystem-dependent, because everything git reports about a working tree
+is checkout state — two variables holding today's branch name say nothing about
+how the makefile is written, and MK006 ignores them.
+
 ### Ground truth from make, not from the manual
 
 Several fine points were settled by experiment against GNU Make 4.4.1, and the
@@ -153,6 +203,10 @@ coincidence as a duplicate.
 ## Known limits
 
 - Only GNU Make. BSD make's `.if` / `.for` is a different language.
+- Recipes are expanded to find variable uses, so a `$(shell ...)` inside a
+  recipe runs during linting even though make would only run it when building
+  that target. Everything the allowlist permits is read-only, but it is more
+  commands than a plain `make -n` would run.
 - A makefile fragment that is only ever included by another (a kernel
   subdirectory `Makefile`, say) cannot see the macros its parent supplies. Lint
   the real entry point.
@@ -171,8 +225,10 @@ coincidence as a duplicate.
 cargo test
 ```
 
-123 tests. `tests/checks.rs` is largely regressions for false positives found by
+154 tests. `tests/checks.rs` is largely regressions for false positives found by
 running the linter across ~400 real makefiles from the Calico, GNU make, and
 Linux kernel trees; `tests/differential.rs` checks the evaluator against make
-itself. `examples/dump.rs` prints the resolved variable table, which is how the
+itself, including the values `$(shell ...)` produces. One test writes a
+makefile that tries ten ways to run `touch` from `$(shell)` and asserts the file
+never appears. `examples/dump.rs` prints the resolved variable table, which is how the
 differential comparison is done by hand.

@@ -14,6 +14,7 @@ pub mod funcs;
 pub mod lexer;
 pub mod parser;
 pub mod render;
+pub mod shell;
 pub mod span;
 pub mod value;
 pub mod workspace;

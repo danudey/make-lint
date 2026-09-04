@@ -269,3 +269,68 @@ fn wildcard_reads_the_tree() {
     assert_eq!(ours.get("SRCS").map(String::as_str), Some("src/a.c src/b.c"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Only allowlisted commands appear here: make will really run whatever is in
+// the file, so the fixture must be safe to execute.
+#[test]
+fn shell_output_matches_make() {
+    let Some(_) = gnu_make() else { return };
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("make-lint-sh-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("VERSION"), "v3.29.1\n").unwrap();
+    std::fs::write(
+        dir.join("Makefile"),
+        r#"
+VER := $(shell cat VERSION)
+KERNEL := $(shell uname -s)
+LOWER := $(shell uname -s | tr A-Z a-z)
+BASE := $(shell basename /a/b/c.txt)
+DIR := $(shell dirname a/b/c.txt)
+WORDS := $(shell echo one two three)
+MULTILINE := $(shell printf 'a\nb\n')
+TRAILING := $(shell printf 'x\n\n')
+EMPTYOUT := $(shell printf '')
+QUOTED := $(shell echo "hello world")
+CHAINED := $(shell echo one two | wc -w)
+BANGED != echo from-bang
+DEFERRED = $(shell echo deferred)
+all: ; @true
+"#,
+    )
+    .unwrap();
+
+    let make = gnu_make().unwrap();
+    let names: Vec<String> = [
+        "VER",
+        "KERNEL",
+        "LOWER",
+        "BASE",
+        "DIR",
+        "WORDS",
+        "MULTILINE",
+        "TRAILING",
+        "EMPTYOUT",
+        "QUOTED",
+        "CHAINED",
+        "BANGED",
+        "DEFERRED",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let theirs = make_values(&make, &dir, &names);
+    let ours = our_values(&dir);
+    let mut wrong = Vec::new();
+    for (k, want) in &theirs {
+        match ours.get(k) {
+            None => wrong.push(format!("{k}: make={want:?}, we did not resolve it")),
+            Some(got) if got != want => wrong.push(format!("{k}: make={want:?}, ours={got:?}")),
+            Some(_) => {}
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(wrong.is_empty(), "{} disagree:\n  {}", wrong.len(), wrong.join("\n  "));
+}

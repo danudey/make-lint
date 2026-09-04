@@ -15,6 +15,7 @@
 use crate::ast::*;
 use crate::builtins;
 use crate::funcs;
+use crate::shell::{self, Oracle, Outcome};
 use crate::span::{FileId, Span};
 use crate::value::*;
 use crate::workspace::Workspace;
@@ -32,6 +33,27 @@ const FORK_BUDGET: u32 = 3000;
 // ---------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------
+
+/// How the analysis is allowed to reach outside the makefile.
+pub struct Options {
+    pub exec: shell::Mode,
+    /// Extra command names the user has allowed.
+    pub allow_commands: Vec<String>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { exec: shell::Mode::Allowlist, allow_commands: Vec::new() }
+    }
+}
+
+/// A `$(shell ...)` that was not run, and why.
+#[derive(Clone, Debug)]
+pub struct ShellRefusal {
+    pub command: String,
+    pub span: Span,
+    pub reason: shell::DenyReason,
+}
 
 #[derive(Clone, Debug)]
 pub struct Reference {
@@ -89,6 +111,8 @@ pub struct Analysis {
     pub pattern_targets: Vec<String>,
     /// True when evaluation ran out of fork budget and had to approximate.
     pub degraded: bool,
+    /// Commands the oracle declined to run.
+    pub shell_refusals: Vec<ShellRefusal>,
     /// For each variable, the variables its value was read from. Needed to tell
     /// a coincidence from a derivation: `TAG := $(VERSION)` matching VERSION is
     /// not two variables that happen to agree.
@@ -96,7 +120,11 @@ pub struct Analysis {
 }
 
 pub fn analyse(ws: &Workspace) -> Analysis {
-    let mut ev = Evaluator::new(ws);
+    analyse_with(ws, &Options::default())
+}
+
+pub fn analyse_with(ws: &Workspace, opts: &Options) -> Analysis {
+    let mut ev = Evaluator::new(ws, opts);
     let roots = ws.roots.clone();
     for root in roots {
         ev.read_file(root);
@@ -163,12 +191,13 @@ struct Evaluator<'a> {
     resolved: HashMap<u32, Value>,
     /// Variable whose value is being expanded, so reads can be attributed.
     current_var: Option<String>,
+    oracle: Oracle,
     base_dir: PathBuf,
     out: Analysis,
 }
 
 impl<'a> Evaluator<'a> {
-    fn new(ws: &'a Workspace) -> Self {
+    fn new(ws: &'a Workspace, opts: &Options) -> Self {
         let mut assigned_anywhere = HashSet::new();
         for mf in ws.makefiles() {
             mf.walk_items(&mut |it| match it {
@@ -204,6 +233,7 @@ impl<'a> Evaluator<'a> {
             fork_budget: FORK_BUDGET,
             resolved: HashMap::new(),
             current_var: None,
+            oracle: Oracle::new(opts.exec, base_dir.clone(), &opts.allow_commands),
             base_dir: base_dir.clone(),
             out: Analysis::default(),
         };
@@ -328,8 +358,18 @@ impl<'a> Evaluator<'a> {
                 }
             },
             AssignOp::Shell => {
+                self.immediate = true;
+                let text = self.expand(&a.value, &mut ctx);
+                self.immediate = false;
                 self.record_clobber(&name, existing, a.span);
-                Body::Immediate(Value::unknown(UnknownReason::ShellAssign, a.value.span))
+                let v = match text.as_known() {
+                    Some(t) => {
+                        let t = t.to_string();
+                        self.run_shell(&t, a.value.span, UnknownReason::ShellAssign)
+                    }
+                    None => text.propagate(a.value.span),
+                };
+                Body::Immediate(v)
             }
             AssignOp::Recursive => {
                 self.record_clobber(&name, existing, a.span);
@@ -708,6 +748,24 @@ impl<'a> Evaluator<'a> {
         Value::unknown(UnknownReason::Undefined, span)
     }
 
+    /// Ask the oracle to run a command, recording anything it declines so the
+    /// reason can be reported rather than silently becoming empty.
+    fn run_shell(&mut self, text: &str, span: Span, reason: UnknownReason) -> Value {
+        match self.oracle.run(text) {
+            Outcome::Ran { output, stability } => {
+                Value::known_with(shell::shell_output(&output), stability)
+            }
+            Outcome::Refused(why) => {
+                self.out.shell_refusals.push(ShellRefusal {
+                    command: text.to_string(),
+                    span,
+                    reason: why,
+                });
+                Value::unknown(reason, span)
+            }
+        }
+    }
+
     fn arg(&mut self, c: &'a FuncCall, i: usize, ctx: &mut Ctx) -> Value {
         match c.args.get(i) {
             Some(e) => self.expand(e, ctx),
@@ -980,7 +1038,10 @@ impl<'a> Evaluator<'a> {
             // These print and expand to nothing.
             "error" | "warning" | "info" => Value::known(""),
 
-            "shell" => Value::unknown(UnknownReason::Shell, c.span),
+            "shell" => {
+                let text = s!(0);
+                self.run_shell(&text, c.span, UnknownReason::Shell)
+            }
             other => Value::unknown(
                 UnknownReason::Unsupported(match other {
                     "file" => "file",

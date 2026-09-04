@@ -16,8 +16,12 @@ use crate::workspace::Workspace;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub fn run(ws: &Workspace) -> Vec<Diagnostic> {
+    run_with(ws, &eval::Options::default())
+}
+
+pub fn run_with(ws: &Workspace, opts: &eval::Options) -> Vec<Diagnostic> {
     let index = Index::build(ws);
-    let analysis = eval::analyse(ws);
+    let analysis = eval::analyse_with(ws, opts);
     let mut out = Vec::new();
     for mf in ws.makefiles() {
         for_each_expr(mf, &mut |e| {
@@ -64,6 +68,7 @@ pub fn run(ws: &Workspace) -> Vec<Diagnostic> {
     let duplicated = mk006_duplicate_value(ws, &analysis, &index, &mut out);
     mk007_alias(ws, &analysis, &index, &mut out);
     mk008_same_expression(ws, &analysis, &index, &duplicated, &mut out);
+    mk040_command_not_run(&analysis, &mut out);
     out
 }
 
@@ -1134,4 +1139,33 @@ fn mk008_same_expression(
 
 fn normalise_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// MK040 — a `$(shell ...)` the oracle would not run
+// ---------------------------------------------------------------------------
+
+/// Reports each command that was not run, and why. Without this a refused
+/// command is indistinguishable from one that produced nothing, and the reader
+/// has no way to see that a value is missing rather than empty.
+fn mk040_command_not_run(a: &Analysis, out: &mut Vec<Diagnostic>) {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for r in &a.shell_refusals {
+        if !seen.insert(r.command.as_str()) {
+            continue;
+        }
+        let allowable = matches!(r.reason, crate::shell::DenyReason::NotAllowed(_));
+        let mut d = Diagnostic::new(
+            "MK040",
+            Severity::Note,
+            r.span,
+            format!("`$(shell {})` was not run: {}", shorten(&r.command, 50), r.reason.describe()),
+        );
+        d = if allowable {
+            d.with_help("values derived from it stay unknown; `--allow-command NAME` permits it")
+        } else {
+            d.with_help("values derived from it stay unknown")
+        };
+        out.push(d);
+    }
 }
