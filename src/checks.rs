@@ -80,7 +80,7 @@ pub fn run_with(ws: &Workspace, opts: &eval::Options) -> Vec<Diagnostic> {
 /// over-approximating definedness means fewer false "undefined" reports, which
 /// is the right trade for a linter.
 struct Index {
-    defined: HashSet<str>,
+    defined: HashSet<String>,
     /// Every literal rule target in the workspace. An `include` of one of these
     /// is make's "remaking makefiles" feature, not a missing file.
     targets: HashSet<String>,
