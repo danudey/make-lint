@@ -9,6 +9,9 @@ cargo build --release
 ./target/release/make-lint --show-notes # include the quieter findings
 ./target/release/make-lint -f lib.mk --format json
 ./target/release/make-lint --no-exec       # run no commands at all
+./target/release/make-lint --format sarif  # for CI
+./target/release/make-lint --fix           # apply the unambiguous fixes
+./target/release/make-lint --explain MK006
 ```
 
 Exit code `0` when nothing at or above `--fail-level` (default `warning`) was
@@ -16,15 +19,14 @@ found, `1` when something was, `2` on a bad argument or unreadable file.
 
 ## Status
 
-Phases 1 to 4 of 5, with no dependencies.
+All five phases, with no dependencies.
 
 * **Phase 1** — lexer, parser, and the checks that need syntax only.
 * **Phase 2** — the evaluator: make's variable table, built-in functions, and
   the checks that need values.
 * **Phase 3** — duplicate-value detection.
 * **Phase 4** — the `$(shell ...)` oracle.
-
-Still to come: SARIF output, a config file, and suppression comments (phase 5).
+* **Phase 5** — SARIF, configuration, suppression comments, and `--fix`.
 
 ## Checks
 
@@ -55,7 +57,61 @@ Notes are hidden unless `--show-notes` is passed.
 | MK036 | error | Malformed `ifeq` / `ifdef` condition |
 | MK050 | warning | Non-optional `include` of a file that does not exist and is not a target |
 | MK040 | note | A `$(shell ...)` that was not run, and why |
+| MK097 | warning | A suppression comment names a rule that does not exist |
 | MK098 | note | The file announces itself as generated, so advice about how it is written was suppressed |
+
+`make-lint --list-rules` prints the table above; `--explain MK006` prints the
+reasoning behind one rule.
+
+## Suppressing a finding
+
+```makefile
+CFLAGS = -O2   # make-lint: disable=MK010
+
+# make-lint: disable=duplicate-value
+REGISTRY := quay.io/calico
+```
+
+A marker at the end of a line covers that line; on a line of its own it covers
+the next. `disable-file` covers the whole file, and omitting `=CODE` covers
+every rule. Codes and slugs both work. A comment naming a rule that does not
+exist is reported (MK097) rather than silently doing nothing, and the run
+summary says how many findings were suppressed so they do not simply vanish.
+
+## Configuration
+
+`.make-lint.toml`, looked for beside the makefile and then in each parent
+directory, so linting a subdirectory still picks up the project's settings.
+
+```toml
+disable = ["MK002", "append-before-definition"]
+fail-level = "error"
+include-dirs = ["mk"]
+
+[severity]
+MK006 = "note"
+
+[exec]
+enabled = true
+allow = ["cksum"]
+```
+
+An unknown key, an unknown rule, or a value of the wrong type is an error, not a
+shrug: a setting that silently does nothing is worse than one that fails, since
+the reader believes it worked. The command line wins wherever it said something.
+
+The parser is a small TOML subset written here rather than pulled in as a
+dependency — a linter that runs commands should be able to account for every
+line of code it ships, and the config surface is not big enough to be worth a
+crate.
+
+## Fixing
+
+`--fix` applies only the rewrites with a single obvious answer: `$FOO` becomes
+`$(FOO)` (MK010), and a space-indented recipe line becomes a tab-indented one
+(MK025). Nothing else offers a fix, because nothing else has one answer a linter
+should pick on someone's behalf. Overlapping fixes are resolved before anything
+is written, and suppressing a finding also declines its fix.
 
 ## Design notes
 
@@ -225,10 +281,12 @@ coincidence as a duplicate.
 cargo test
 ```
 
-154 tests. `tests/checks.rs` is largely regressions for false positives found by
+189 tests. `tests/checks.rs` is largely regressions for false positives found by
 running the linter across ~400 real makefiles from the Calico, GNU make, and
 Linux kernel trees; `tests/differential.rs` checks the evaluator against make
-itself, including the values `$(shell ...)` produces. One test writes a
-makefile that tries ten ways to run `touch` from `$(shell)` and asserts the file
-never appears. `examples/dump.rs` prints the resolved variable table, which is how the
+itself, including the values `$(shell ...)` produces; `tests/cli.rs` drives the
+binary, since the config file, suppression comments, output formats and `--fix`
+only meet each other in `main`. One test writes a makefile that tries ten ways
+to run `touch` from `$(shell)` and asserts the file never appears.
+`examples/dump.rs` prints the resolved variable table, which is how the
 differential comparison is done by hand.

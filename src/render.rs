@@ -205,6 +205,118 @@ fn quote(s: &str) -> String {
     o
 }
 
+// ---------------------------------------------------------------------------
+// SARIF 2.1.0
+// ---------------------------------------------------------------------------
+
+/// Paths in SARIF should be relative to the repository so a CI viewer can line
+/// them up with the checkout.
+fn sarif_uri(path: &std::path::Path, root: &std::path::Path) -> String {
+    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
+}
+
+fn sarif_level(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Note => "note",
+    }
+}
+
+/// A stable-ish identity for a finding, so a viewer can follow it across edits
+/// that move it to a different line.
+fn fingerprint(code: &str, message: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in code.bytes().chain(message.bytes()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+fn region(out: &mut String, sm: &SourceMap, span: Span) {
+    let f = sm.get(span.file);
+    let (line, col) = f.line_col(span.start);
+    let (end_line, end_col) = f.line_col(span.end);
+    let _ = write!(
+        out,
+        r#""region":{{"startLine":{line},"startColumn":{col},"endLine":{end_line},"endColumn":{}}}"#,
+        end_col.max(col)
+    );
+}
+
+pub fn sarif(diags: &[Diagnostic], sm: &SourceMap, root: &std::path::Path) -> String {
+    let mut out = String::new();
+    out.push_str(
+        r#"{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"make-lint","#,
+    );
+    let _ = write!(
+        out,
+        r#""version":{},"informationUri":"https://github.com/","rules":["#,
+        quote(env!("CARGO_PKG_VERSION"))
+    );
+    for (i, r) in crate::rules::RULES.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            r#"{{"id":{},"name":{},"shortDescription":{{"text":{}}},"fullDescription":{{"text":{}}},"defaultConfiguration":{{"level":{}}}}}"#,
+            quote(r.code),
+            quote(r.name),
+            quote(r.summary),
+            quote(&r.explanation.replace('\n', " ")),
+            quote(sarif_level(r.severity))
+        );
+    }
+    out.push_str(r#"]}},"results":["#);
+
+    for (i, d) in diags.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let f = sm.get(d.primary.file);
+        let _ = write!(
+            out,
+            r#"{{"ruleId":{},"level":{},"message":{{"text":{}}},"locations":[{{"physicalLocation":{{"artifactLocation":{{"uri":{}}},"#,
+            quote(d.code),
+            quote(sarif_level(d.severity)),
+            quote(&match &d.help {
+                Some(h) => format!("{}\n{h}", d.message),
+                None => d.message.clone(),
+            }),
+            quote(&sarif_uri(&f.path, root))
+        );
+        region(&mut out, sm, d.primary);
+        out.push_str("}}]");
+
+        if !d.secondary.is_empty() {
+            out.push_str(r#","relatedLocations":["#);
+            for (j, l) in d.secondary.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                let lf = sm.get(l.span.file);
+                let _ = write!(
+                    out,
+                    r#"{{"physicalLocation":{{"artifactLocation":{{"uri":{}}},"#,
+                    quote(&sarif_uri(&lf.path, root))
+                );
+                region(&mut out, sm, l.span);
+                let _ = write!(out, r#"}},"message":{{"text":{}}}}}"#, quote(&l.message));
+            }
+            out.push(']');
+        }
+        let _ = write!(
+            out,
+            r#","partialFingerprints":{{"makeLintHash/v1":{}}}}}"#,
+            quote(&fingerprint(d.code, &d.message))
+        );
+    }
+    out.push_str("]}]}\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

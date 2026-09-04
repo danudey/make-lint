@@ -244,13 +244,21 @@ fn mk010_bare_reference(v: &VarRef, out: &mut Vec<Diagnostic>) {
     if builtins::is_automatic(&name) {
         return;
     }
+    // The run-on characters sit immediately after the reference, so one span
+    // covers `$FOO` and one replacement fixes it.
+    let whole = Span::new(v.span.file, v.span.start as usize, v.span.end as usize + run.len());
     out.push(
         Diagnostic::warn(
             "MK010",
             v.span,
             format!("`${name}` refers to the one-character variable `{name}`, then the literal text `{run}`"),
         )
-        .with_help(format!("write `$({name}{run})` for the variable, or `$${name}{run}` for a shell variable")),
+        .with_help(format!("write `$({name}{run})` for the variable, or `$${name}{run}` for a shell variable"))
+        .with_fix(crate::fix::Fix {
+            span: whole,
+            replacement: format!("$({name}{run})"),
+            description: format!("`${name}{run}` to `$({name}{run})`"),
+        }),
     );
 }
 

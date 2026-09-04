@@ -42,6 +42,8 @@ pub struct Diagnostic {
     pub primary: Span,
     pub secondary: Vec<Label>,
     pub help: Option<String>,
+    /// Present only where the rewrite has a single obvious answer.
+    pub fix: Option<crate::fix::Fix>,
 }
 
 impl Diagnostic {
@@ -58,6 +60,7 @@ impl Diagnostic {
             primary,
             secondary: Vec::new(),
             help: None,
+            fix: None,
         }
     }
 
@@ -80,6 +83,11 @@ impl Diagnostic {
 
     pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Self {
         self.secondary.push(Label { span, message: message.into() });
+        self
+    }
+
+    pub fn with_fix(mut self, fix: crate::fix::Fix) -> Self {
+        self.fix = Some(fix);
         self
     }
 }

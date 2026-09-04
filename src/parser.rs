@@ -263,7 +263,12 @@ impl Parser<'_> {
                     line.span_of(0, cs),
                     "recipe line indented with spaces, not a tab",
                 )
-                .with_help("make will not treat this as part of the recipe"),
+                .with_help("make will not treat this as part of the recipe")
+                .with_fix(crate::fix::Fix {
+                    span: line.span_of(0, cs),
+                    replacement: "\t".to_string(),
+                    description: "leading spaces to a tab".to_string(),
+                }),
             );
         } else if line.had_recipe_prefix {
             self.diags.push(

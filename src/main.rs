@@ -1,6 +1,8 @@
+use make_lint::config::Config;
 use make_lint::diag::Severity;
+use make_lint::suppress::Suppressions;
 use make_lint::workspace::Workspace;
-use make_lint::{DEFAULT_MAKEFILES, checks, render};
+use make_lint::{DEFAULT_MAKEFILES, checks, eval, fix, render, rules, shell};
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -18,20 +20,31 @@ directory. Statically resolvable `include` directives are followed.
 OPTIONS:
     -f, --file <FILE>        Makefile to lint (repeatable)
     -I, --include-dir <DIR>  Extra directory to search for includes (repeatable)
-        --format <FORMAT>    text (default) or json
+        --format <FORMAT>    text (default), json, or sarif
         --fail-level <LEVEL> note, warning (default), or error
         --color <WHEN>       auto (default), always, or never
         --show-notes         Include note-level diagnostics in the output
+        --fix                Apply the fixes that have one obvious answer
         --no-exec            Never run a $(shell ...) command
         --allow-command <C>  Also run this command when it appears in
                              $(shell ...) (repeatable)
-
-By default make-lint runs the $(shell ...) commands it can prove are read-only:
-an allowlist of plain commands with no redirection, no substitution, and path
-arguments confined to the project directory. Everything else is left unresolved
-and reported as MK040. Use --no-exec to run nothing at all.
+        --config <FILE>      Read this config instead of searching for one
+        --no-config          Ignore any .make-lint.toml
+        --explain <CODE>     Describe one rule and exit
+        --list-rules         List every rule and exit
     -h, --help               Print this help
     -V, --version            Print version
+
+SUPPRESSING A FINDING:
+    A `# make-lint: disable=MK006` comment at the end of a line covers that
+    line; on a line of its own it covers the next. `disable-file` covers the
+    whole file, and omitting `=CODE` covers every rule.
+
+RUNNING COMMANDS:
+    By default make-lint runs the $(shell ...) commands it can prove are
+    read-only: an allowlist of plain commands with no redirection, no
+    substitution, and path arguments confined to the project directory.
+    Everything else is left unresolved and reported as MK040.
 
 EXIT CODES:
     0  no diagnostics at or above --fail-level
@@ -43,6 +56,7 @@ EXIT CODES:
 enum Format {
     Text,
     Json,
+    Sarif,
 }
 
 struct Args {
@@ -52,37 +66,66 @@ struct Args {
     fail_level: Severity,
     color: Option<bool>,
     show_notes: bool,
-    exec: make_lint::shell::Mode,
+    apply_fixes: bool,
+    exec: Option<shell::Mode>,
     allow_commands: Vec<String>,
+    config_path: Option<PathBuf>,
+    no_config: bool,
 }
 
 fn main() -> ExitCode {
-    let args = match parse_args() {
-        Ok(Some(a)) => a,
-        Ok(None) => return ExitCode::SUCCESS,
+    match run() {
+        Ok(code) => code,
         Err(e) => {
             eprintln!("make-lint: {e}");
-            eprintln!("try `make-lint --help`");
-            return ExitCode::from(2);
+            ExitCode::from(2)
         }
+    }
+}
+
+fn run() -> Result<ExitCode, String> {
+    let Some(mut args) = parse_args()? else { return Ok(ExitCode::SUCCESS) };
+
+    // The config is looked for next to the makefile, so linting a subdirectory
+    // still picks up the project's settings.
+    let anchor = args
+        .files
+        .first()
+        .and_then(|f| f.parent().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let config = match (&args.config_path, args.no_config) {
+        (_, true) => Config::default(),
+        (Some(p), _) => Config::load(p)?,
+        (None, _) => Config::discover(&anchor)?,
     };
+    apply_config(&mut args, &config);
 
-    let mut ws = Workspace::new(args.include_dirs);
-    let mut failed = false;
+    let mut ws = Workspace::new(args.include_dirs.clone());
     for f in &args.files {
-        if let Err(e) = ws.load_root(f) {
-            eprintln!("make-lint: cannot read {}: {e}", f.display());
-            failed = true;
-        }
-    }
-    if failed {
-        return ExitCode::from(2);
+        ws.load_root(f).map_err(|e| format!("cannot read {}: {e}", f.display()))?;
     }
 
-    let opts =
-        make_lint::eval::Options { exec: args.exec, allow_commands: args.allow_commands.clone() };
+    let opts = eval::Options {
+        exec: args.exec.unwrap_or(shell::Mode::Allowlist),
+        allow_commands: args.allow_commands.clone(),
+    };
     let mut diags = std::mem::take(&mut ws.diags);
     diags.extend(checks::run_with(&ws, &opts));
+
+    // Rules switched off entirely, then severities forced.
+    diags.retain(|d| !config.disable.iter().any(|c| c == d.code));
+    for d in &mut diags {
+        if let Some(&s) = config.severity.get(d.code) {
+            d.severity = s;
+        }
+    }
+
+    let suppressions = Suppressions::scan(&ws.sources);
+    let suppressed = suppressions.apply(&mut diags, &ws.sources);
+    suppressions.report_unknown(&ws.sources, &mut diags);
+
+    let applied = if args.apply_fixes { Some(fix::apply(&diags, &ws.sources)?) } else { None };
+
     if !args.show_notes {
         diags.retain(|d| d.severity > Severity::Note);
     }
@@ -90,21 +133,82 @@ fn main() -> ExitCode {
 
     match args.format {
         Format::Json => print!("{}", render::json(&diags, &ws.sources)),
+        Format::Sarif => print!("{}", render::sarif(&diags, &ws.sources, &ws.base_dir())),
         Format::Text => {
             let color = args.color.unwrap_or_else(|| std::io::stdout().is_terminal());
             print!("{}", render::text(&diags, &ws.sources, &render::Style { color }));
-            let n = diags.len();
-            if n > 0 {
-                eprintln!("{n} diagnostic{}", if n == 1 { "" } else { "s" });
-            }
+            summarise(diags.len(), suppressed, applied.as_ref());
         }
     }
 
-    if diags.iter().any(|d| d.severity >= args.fail_level) {
+    Ok(if diags.iter().any(|d| d.severity >= args.fail_level) {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    })
+}
+
+fn summarise(shown: usize, suppressed: usize, applied: Option<&fix::Applied>) {
+    let mut parts = Vec::new();
+    if shown > 0 {
+        parts.push(format!("{shown} diagnostic{}", plural(shown)));
     }
+    if suppressed > 0 {
+        parts.push(format!("{suppressed} suppressed"));
+    }
+    if let Some(a) = applied {
+        parts.push(format!(
+            "{} fix{} applied in {} file{}",
+            a.fixes,
+            if a.fixes == 1 { "" } else { "es" },
+            a.files,
+            plural(a.files)
+        ));
+        if a.skipped > 0 {
+            parts.push(format!("{} skipped as overlapping", a.skipped));
+        }
+    }
+    if !parts.is_empty() {
+        eprintln!("{}", parts.join(", "));
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// The command line wins wherever it said something.
+fn apply_config(args: &mut Args, config: &Config) {
+    if args.exec.is_none()
+        && let Some(enabled) = config.exec
+    {
+        args.exec = Some(if enabled { shell::Mode::Allowlist } else { shell::Mode::Deny });
+    }
+    args.allow_commands.extend(config.allow_commands.iter().cloned());
+    args.include_dirs.extend(config.include_dirs.iter().cloned());
+    if let Some(l) = config.fail_level {
+        args.fail_level = l;
+    }
+    if let Some(n) = config.show_notes {
+        args.show_notes |= n;
+    }
+    if args.fail_level == Severity::Note {
+        args.show_notes = true;
+    }
+}
+
+fn list_rules() {
+    for r in rules::RULES {
+        println!("{}  {:<7}  {:<26}  {}", r.code, r.severity.as_str(), r.name, r.summary);
+    }
+}
+
+fn explain(key: &str) -> Result<(), String> {
+    let r = rules::lookup(key).ok_or_else(|| format!("`{key}` is not a rule; try --list-rules"))?;
+    println!("{}  {}  [{}]\n", r.code, r.name, r.severity.as_str());
+    println!("{}\n", r.summary);
+    println!("{}", r.explanation);
+    Ok(())
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -115,15 +219,18 @@ fn parse_args() -> Result<Option<Args>, String> {
         fail_level: Severity::Warning,
         color: None,
         show_notes: false,
-        exec: make_lint::shell::Mode::Allowlist,
+        apply_fixes: false,
+        exec: None,
         allow_commands: Vec::new(),
+        config_path: None,
+        no_config: false,
     };
     let mut it = std::env::args().skip(1);
     let mut positional = Vec::new();
 
     while let Some(arg) = it.next() {
         let mut next = |flag: &str| -> Result<String, String> {
-            it.next().ok_or_else(|| format!("{flag} needs a value"))
+            it.next().ok_or(format!("{flag} needs a value"))
         };
         match arg.as_str() {
             "-h" | "--help" => {
@@ -134,21 +241,33 @@ fn parse_args() -> Result<Option<Args>, String> {
                 println!("make-lint {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
+            "--list-rules" => {
+                list_rules();
+                return Ok(None);
+            }
+            "--explain" => {
+                explain(&next("--explain")?)?;
+                return Ok(None);
+            }
             "-f" | "--file" => a.files.push(PathBuf::from(next("--file")?)),
             "-I" | "--include-dir" => a.include_dirs.push(PathBuf::from(next("--include-dir")?)),
             "--show-notes" => a.show_notes = true,
-            "--no-exec" => a.exec = make_lint::shell::Mode::Deny,
+            "--fix" => a.apply_fixes = true,
+            "--no-exec" => a.exec = Some(shell::Mode::Deny),
             "--allow-command" => a.allow_commands.push(next("--allow-command")?),
+            "--config" => a.config_path = Some(PathBuf::from(next("--config")?)),
+            "--no-config" => a.no_config = true,
             "--format" => {
                 a.format = match next("--format")?.as_str() {
                     "text" => Format::Text,
                     "json" => Format::Json,
+                    "sarif" => Format::Sarif,
                     other => return Err(format!("unknown format `{other}`")),
                 }
             }
             "--fail-level" => {
                 let v = next("--fail-level")?;
-                a.fail_level = Severity::parse(&v).ok_or_else(|| format!("unknown level `{v}`"))?;
+                a.fail_level = Severity::parse(&v).ok_or(format!("unknown level `{v}`"))?;
             }
             "--color" => {
                 a.color = match next("--color")?.as_str() {
@@ -159,7 +278,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 }
             }
             s if s.starts_with('-') && s.len() > 1 => {
-                return Err(format!("unknown option `{s}`"));
+                return Err(format!("unknown option `{s}`; try --help"));
             }
             s => positional.push(PathBuf::from(s)),
         }
@@ -174,7 +293,6 @@ fn parse_args() -> Result<Option<Args>, String> {
             .ok_or("no makefile found in the current directory")?;
         a.files.push(found);
     }
-    // `--show-notes` only makes sense if notes can still fail the run.
     if a.fail_level == Severity::Note {
         a.show_notes = true;
     }
