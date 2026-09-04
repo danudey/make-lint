@@ -57,6 +57,8 @@ pub struct ResolvedVar {
     pub flags: AssignFlags,
     /// The branches of an undecidable conditional disagreed about this one.
     pub ambiguous: bool,
+    /// Provided by the evaluator rather than by any makefile, as CURDIR is.
+    pub synthetic: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +89,10 @@ pub struct Analysis {
     pub pattern_targets: Vec<String>,
     /// True when evaluation ran out of fork budget and had to approximate.
     pub degraded: bool,
+    /// For each variable, the variables its value was read from. Needed to tell
+    /// a coincidence from a derivation: `TAG := $(VERSION)` matching VERSION is
+    /// not two variables that happen to agree.
+    pub reads: HashMap<String, HashSet<String>>,
 }
 
 pub fn analyse(ws: &Workspace) -> Analysis {
@@ -120,6 +126,7 @@ struct VarDef<'a> {
     /// Read-order position of this assignment.
     seq: u32,
     ambiguous: bool,
+    synthetic: bool,
 }
 
 /// Expansion context: `$(call)` arguments and `$(foreach)` bindings.
@@ -154,6 +161,8 @@ struct Evaluator<'a> {
     fork_depth: usize,
     fork_budget: u32,
     resolved: HashMap<u32, Value>,
+    /// Variable whose value is being expanded, so reads can be attributed.
+    current_var: Option<String>,
     base_dir: PathBuf,
     out: Analysis,
 }
@@ -194,6 +203,7 @@ impl<'a> Evaluator<'a> {
             fork_depth: 0,
             fork_budget: FORK_BUDGET,
             resolved: HashMap::new(),
+            current_var: None,
             base_dir: base_dir.clone(),
             out: Analysis::default(),
         };
@@ -209,6 +219,7 @@ impl<'a> Evaluator<'a> {
                 flags: AssignFlags::default(),
                 seq: 0,
                 ambiguous: false,
+                synthetic: true,
             },
         );
         ev
@@ -326,7 +337,9 @@ impl<'a> Evaluator<'a> {
             }
             AssignOp::Simple | AssignOp::SimplePosix | AssignOp::Immediate => {
                 self.immediate = true;
+                let outer_var = self.current_var.replace(name.clone());
                 let v = self.expand(&a.value, &mut ctx);
+                self.current_var = outer_var;
                 self.immediate = false;
                 // Checked after expanding: `X := $(X) more` reads the old value.
                 self.record_clobber(&name, existing, a.span);
@@ -336,7 +349,16 @@ impl<'a> Evaluator<'a> {
 
         self.push_def(
             name.clone(),
-            VarDef { name, body, op: a.op, span: a.span, flags: a.flags, seq, ambiguous: false },
+            VarDef {
+                name,
+                body,
+                op: a.op,
+                span: a.span,
+                flags: a.flags,
+                seq,
+                ambiguous: false,
+                synthetic: false,
+            },
         );
     }
 
@@ -363,7 +385,16 @@ impl<'a> Evaluator<'a> {
         };
         self.push_def(
             name.clone(),
-            VarDef { name, body, op: d.op, span: d.span, flags: d.flags, seq, ambiguous: false },
+            VarDef {
+                name,
+                body,
+                op: d.op,
+                span: d.span,
+                flags: d.flags,
+                seq,
+                ambiguous: false,
+                synthetic: false,
+            },
         );
     }
 
@@ -477,6 +508,7 @@ impl<'a> Evaluator<'a> {
                 flags: AssignFlags::default(),
                 seq,
                 ambiguous: true,
+                synthetic: false,
             });
             merged.insert(name, (self.defs.len() - 1) as u32);
         }
@@ -514,6 +546,7 @@ impl<'a> Evaluator<'a> {
                 flags: AssignFlags::default(),
                 seq: self.seq,
                 ambiguous: true,
+                synthetic: false,
             });
             self.env.insert(name, (self.defs.len() - 1) as u32);
         }
@@ -574,6 +607,7 @@ impl<'a> Evaluator<'a> {
                     self.out.recursive.push(Reference { name, span });
                     return Value::unknown(UnknownReason::Recursion, span);
                 }
+                let outer_var = self.current_var.replace(name.clone());
                 ctx.stack.push(name);
                 let outer_impure = std::mem::replace(&mut ctx.impure, false);
                 let mut vals = Vec::with_capacity(parts.len() * 2);
@@ -586,6 +620,7 @@ impl<'a> Evaluator<'a> {
                 let impure = ctx.impure;
                 ctx.impure = outer_impure || impure;
                 ctx.stack.pop();
+                self.current_var = outer_var;
 
                 let v = Value::concat(vals);
                 if cacheable && !impure {
@@ -651,6 +686,9 @@ impl<'a> Evaluator<'a> {
         }
         if self.immediate {
             self.last_read.insert(name.to_string(), self.seq);
+        }
+        if let Some(cur) = self.current_var.clone() {
+            self.out.reads.entry(cur).or_default().insert(name.to_string());
         }
         if let Some(&id) = self.env.get(name) {
             return self.resolve_def(id, ctx);
@@ -979,6 +1017,7 @@ impl<'a> Evaluator<'a> {
                     flags: AssignFlags::default(),
                     seq,
                     ambiguous: false,
+                    synthetic: false,
                 },
             );
         }
@@ -1001,6 +1040,7 @@ impl<'a> Evaluator<'a> {
                 span: d.span,
                 flags: d.flags,
                 ambiguous: d.ambiguous,
+                synthetic: d.synthetic,
             };
             self.out.vars.insert(name, var);
         }

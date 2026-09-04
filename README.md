@@ -15,14 +15,14 @@ found, `1` when something was, `2` on a bad argument or unreadable file.
 
 ## Status
 
-Phases 1 and 2 of 5, with no dependencies.
+Phases 1 to 3 of 5, with no dependencies.
 
 * **Phase 1** — lexer, parser, and the checks that need syntax only.
 * **Phase 2** — the evaluator: make's variable table, built-in functions, and
   the checks that need values.
+* **Phase 3** — duplicate-value detection.
 
-Still to come: duplicate-value detection (phase 3) and the allowlisted
-`$(shell ...)` oracle (phase 4).
+Still to come: the allowlisted `$(shell ...)` oracle (phase 4).
 
 ## Checks
 
@@ -35,6 +35,9 @@ Notes are hidden unless `--show-notes` is passed.
 | MK003 | warning | An assignment that discards a value nothing had read |
 | MK004 | note | `+=` before the variable has any definition, so it acts as `=` |
 | MK005 | warning | `VAR = $(shell ...)`, which re-runs the command on every expansion |
+| MK006 | warning | Two or more variables that independently resolve to the same distinctive value |
+| MK007 | note | `A = $(B)`: a second live name for the same value |
+| MK008 | note | Two variables defined by the same expression, where the value could not be resolved |
 | MK009 | error | A recursive variable that refers to itself; make refuses to expand it |
 | MK010 | warning | `$FOO`, which make reads as `$(F)` followed by the literal `OO` |
 | MK020 | warning | Two recipes for one target; make silently discards the first |
@@ -49,6 +52,7 @@ Notes are hidden unless `--show-notes` is passed.
 | MK035 | error | Unmatched `else` / `endif`, or a missing `endif` |
 | MK036 | error | Malformed `ifeq` / `ifdef` condition |
 | MK050 | warning | Non-optional `include` of a file that does not exist and is not a target |
+| MK098 | note | The file announces itself as generated, so advice about how it is written was suppressed |
 
 ## Design notes
 
@@ -84,6 +88,36 @@ at once. Similarity alone is not enough, because makefiles are full of
 deliberate families (`BUILD_IMAGE` and `BUILD_IMAGES`, `X_C_FILES` and
 `X_O_FILES`). With that rule the same corpus yields 4 warnings. The rest are
 still there under `--show-notes`.
+
+### Duplicate values: derivation, then distinctiveness
+
+Two variables holding the same value is only interesting when neither got it
+from the other. The evaluator therefore records, for each variable, which
+variables its value was read from, and MK006 drops any member of an equal-value
+group that derives from another member — so `TAG := $(VERSION)` matching
+`VERSION` is arithmetic, not a coincidence. A pure alias (`A = $(B)`) is
+reported separately and quietly as MK007.
+
+What is left is filtered on how distinctive the shared value is. A compound
+value — `github.com/projectcalico/calico/api`, `.crds/enterprise`,
+`quay.io/calico` — appearing under two names is duplication. A bare word like
+`latest`, `master` or `amd64` is a token many variables hold for unrelated
+reasons; pairing those up produced most of the noise in testing, so a value with
+no internal structure has to be long to qualify. That took MK006 from 285
+findings on the corpus to 95, and the survivors are things like
+`KINDEST_NODE_VERSION` and `K8S_VERSION` having to be bumped together.
+
+MK008 covers the case where the value cannot be resolved at all. It compares the
+*expression* rather than the value, so its claim stays exact: the same
+expression is written twice. It only compares definitions of the same flavour,
+since `:=` freezes a value where it stands.
+
+### Generated makefiles are left alone
+
+A makefile whose header says a tool wrote it gets syntax and correctness checks
+but no advice about how it is written — the generator decides that, and the
+duplication in autoconf output is inherent to how it substitutes. MK098 says so
+rather than letting the run look clean.
 
 ### Ground truth from make, not from the manual
 
@@ -137,7 +171,7 @@ coincidence as a duplicate.
 cargo test
 ```
 
-111 tests. `tests/checks.rs` is largely regressions for false positives found by
+123 tests. `tests/checks.rs` is largely regressions for false positives found by
 running the linter across ~400 real makefiles from the Calico, GNU make, and
 Linux kernel trees; `tests/differential.rs` checks the evaluator against make
 itself. `examples/dump.rs` prints the resolved variable table, which is how the
