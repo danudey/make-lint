@@ -1,0 +1,188 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Keeps a release PR up to date with every conventional commit landed on main.
+  # Merging that PR tags the release and unblocks the build jobs below.
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: static musl, so one binary per arch runs on any distro.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: riscv64gc-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          # macOS is built by the build-macos job below, which also lipos the
+          # two slices into a universal binary.
+          # Windows: both arches cross-build from the x64 runner.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        if: matrix.zig
+        with:
+          version: 0.14.1
+      - uses: taiki-e/install-action@v2
+        if: matrix.zig
+        with:
+          tool: cargo-zigbuild
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --locked --release --target "$TARGET"
+          else
+            cargo build --locked --release --target "$TARGET"
+          fi
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="make-lint-${TAG}-${TARGET}"
+          mkdir -p "dist/${name}"
+          if [[ "$TARGET" == *windows* ]]; then
+            cp "target/${TARGET}/release/make-lint.exe" "dist/${name}/"
+          else
+            cp "target/${TARGET}/release/make-lint" "dist/${name}/"
+          fi
+          cp README.md LICENSE "dist/${name}/"
+          cd dist
+          if [[ "$TARGET" == *windows* ]]; then
+            archive="${name}.zip"
+            7z a -tzip "$archive" "$name" >/dev/null
+          else
+            archive="${name}.tar.gz"
+            tar czf "$archive" "$name"
+          fi
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
+          echo "archive=dist/${archive}" >> "$GITHUB_OUTPUT"
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Upload to release
+        shell: bash
+        run: gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+
+  # Both macOS slices plus a universal binary lipo'd from them. Kept out of the
+  # matrix above because the universal artifact needs both builds in one job.
+  build-macos:
+    name: build (apple-darwin)
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: apple-darwin
+
+      - name: Build
+        run: |
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
+
+      - name: Combine into a universal binary
+        run: |
+          set -euo pipefail
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            -output target/universal-apple-darwin/release/make-lint \
+            target/aarch64-apple-darwin/release/make-lint \
+            target/x86_64-apple-darwin/release/make-lint
+          # lipo drops the linker's ad-hoc signature, and an unsigned binary
+          # will not run on Apple Silicon. Re-sign ad-hoc.
+          codesign --force --sign - target/universal-apple-darwin/release/make-lint
+          lipo -info target/universal-apple-darwin/release/make-lint
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          archives=()
+          for target in aarch64-apple-darwin x86_64-apple-darwin universal-apple-darwin; do
+            name="make-lint-${TAG}-${target}"
+            mkdir -p "dist/${name}"
+            cp "target/${target}/release/make-lint" "dist/${name}/"
+            cp README.md LICENSE "dist/${name}/"
+            (cd dist && tar czf "${name}.tar.gz" "$name" \
+              && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+            archives+=("dist/${name}.tar.gz" "dist/${name}.tar.gz.sha256")
+          done
+          echo "archives=${archives[*]}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Upload to release
+        run: gh release upload "$TAG" $ARCHIVES --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          ARCHIVES: ${{ steps.package.outputs.archives }}
