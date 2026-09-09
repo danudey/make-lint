@@ -1,8 +1,9 @@
 //! End-to-end tests driving the binary, since the config file, suppression
 //! comments, output formats and `--fix` only meet each other in `main`.
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -38,6 +39,30 @@ impl Project {
 
     fn stdout(&self, args: &[&str]) -> String {
         String::from_utf8_lossy(&self.run(args).stdout).into_owned()
+    }
+
+    /// Run with `body` on stdin, as an editor linting an unsaved buffer does.
+    fn run_stdin(&self, body: &str, args: &[&str]) -> Output {
+        let mut child = Command::new(bin())
+            .args(["--color", "never"])
+            .args(args)
+            .current_dir(&self.dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn make-lint");
+        child.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
+        child.wait_with_output().expect("run make-lint")
+    }
+
+    fn stdout_stdin(&self, body: &str, args: &[&str]) -> String {
+        String::from_utf8_lossy(&self.run_stdin(body, args).stdout).into_owned()
+    }
+
+    /// The absolute path of a file in the project, as an editor would pass it.
+    fn path(&self, name: &str) -> String {
+        self.dir.join(name).display().to_string()
     }
 
     fn read(&self, name: &str) -> String {
@@ -211,6 +236,88 @@ fn json_output_still_works() {
     let out = p.stdout(&["--format", "json"]);
     assert!(out.starts_with('['));
     assert!(out.contains(r#""code":"MK010""#));
+}
+
+#[test]
+fn json_carries_the_fix_range_and_replacement() {
+    let p = Project::new(&[("Makefile", NOISY)]);
+    let out = p.stdout(&["--format", "json"]);
+    assert!(out.contains(r#""replacement":"$(CFLAGS)""#), "{out}");
+    // The fix spans `$CFLAGS`, four columns wider than the `$C` the
+    // diagnostic underlines, so an editor cannot reuse the diagnostic range.
+    assert!(out.contains(r#""fix":{"description":"`$CFLAGS` to `$(CFLAGS)`""#), "{out}");
+}
+
+#[test]
+fn a_fix_replacement_containing_a_tab_stays_valid_json() {
+    let p = Project::new(&[("Makefile", "all:\n    echo hi\n")]);
+    let out = p.stdout(&["--format", "json"]);
+    assert!(out.contains(r#""replacement":"\t""#), "the tab must be escaped: {out}");
+    assert!(well_formed_json(&out), "{out}");
+}
+
+#[test]
+fn a_diagnostic_with_no_fix_has_no_fix_key() {
+    // MK009 has no single obvious rewrite, so it offers none.
+    let p = Project::new(&[("Makefile", "A = $(A)\nall: ; @true\n")]);
+    let out = p.stdout(&["--format", "json"]);
+    assert!(out.contains(r#""code":"MK009""#), "{out}");
+    assert!(!out.contains(r#""fix""#), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// --stdin-path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stdin_is_linted_in_place_of_the_file_on_disk() {
+    let p = Project::new(&[("Makefile", "CLEAN = 1\nall: ; @true\n")]);
+    let out = p.stdout_stdin(NOISY, &["--stdin-path", &p.path("Makefile"), "--format", "json"]);
+    assert!(out.contains(r#""code":"MK010""#), "the buffer, not the file, is linted: {out}");
+    // ...and the file it names is the one the editor has open, so the
+    // diagnostic lands back on the right buffer.
+    assert!(out.contains(&format!(r#""file":{:?}"#, p.path("Makefile"))), "{out}");
+}
+
+#[test]
+fn a_stdin_buffer_resolves_includes_from_its_own_path() {
+    let p = Project::new(&[("Makefile", "\n"), ("lib.mk", "LIB = 1\n")]);
+    let out = p.stdout_stdin(
+        "include lib.mk\nX := $(LIB)\nall: ; @true\n",
+        &["--stdin-path", &p.path("Makefile"), "--format", "json", "--show-notes"],
+    );
+    // `LIB` resolved, so lib.mk was found and read from disk beside the buffer.
+    assert!(!out.contains(r#""code":"MK001""#), "LIB should be defined: {out}");
+    assert!(!out.contains("MK050"), "the include should have been found: {out}");
+}
+
+#[test]
+fn a_stdin_path_need_not_exist_yet() {
+    let p = Project::new(&[("lib.mk", "LIB = 1\n")]);
+    let out = p.run_stdin(
+        "include lib.mk\nX := $(LIB)\nall: ; @true\n",
+        &["--stdin-path", &p.path("NewMakefile"), "--format", "json", "--show-notes"],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("MK050"), "an unsaved file still resolves includes: {text}");
+    assert!(well_formed_json(&text), "{text}");
+}
+
+#[test]
+fn stdin_refuses_to_write_the_file_it_did_not_read() {
+    let p = Project::new(&[("Makefile", NOISY)]);
+    let out = p.run_stdin("A = $FOO\n", &["--stdin-path", &p.path("Makefile"), "--fix"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--fix cannot write"));
+    assert_eq!(p.read("Makefile"), NOISY, "the file must be left alone");
+}
+
+#[test]
+fn stdin_path_and_a_named_file_together_are_an_error() {
+    let p = Project::new(&[("Makefile", NOISY)]);
+    let out = p.run_stdin("A = 1\n", &["--stdin-path", &p.path("Makefile"), "-f", "Makefile"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("do not also name one"));
 }
 
 // ---------------------------------------------------------------------------

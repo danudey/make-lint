@@ -159,6 +159,27 @@ pub fn json(diags: &[Diagnostic], sm: &SourceMap) -> String {
         if let Some(h) = &d.help {
             let _ = write!(out, r#","help":{}"#, quote(h));
         }
+        // An editor applies this itself, so it carries its own range: a fix
+        // can be wider than the span the diagnostic points at.
+        if let Some(fx) = &d.fix {
+            let ff = sm.get(fx.span.file);
+            let (fl, fc) = ff.line_col(fx.span.start);
+            let (fel, fec) = ff.line_col(fx.span.end);
+            let _ = write!(
+                out,
+                concat!(
+                    r#","fix":{{"description":{},"file":{},"line":{},"column":{},"#,
+                    r#""endLine":{},"endColumn":{},"replacement":{}}}"#
+                ),
+                quote(&fx.description),
+                quote(&ff.path.display().to_string()),
+                fl,
+                fc,
+                fel,
+                fec,
+                quote(&fx.replacement)
+            );
+        }
         if !d.secondary.is_empty() {
             out.push_str(r#","related":["#);
             for (j, l) in d.secondary.iter().enumerate() {

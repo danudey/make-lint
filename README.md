@@ -113,6 +113,52 @@ crate.
 should pick on someone's behalf. Overlapping fixes are resolved before anything
 is written, and suppressing a finding also declines its fix.
 
+`--format json` reports the same rewrites without applying them, so an editor
+can offer them one at a time:
+
+```json
+{
+  "code": "MK010", "severity": "warning", "file": "Makefile",
+  "line": 3, "column": 6, "endLine": 3, "endColumn": 8,
+  "message": "`$C` refers to the one-character variable `C`, ...",
+  "fix": {
+    "description": "`$CFLAGS` to `$(CFLAGS)`", "file": "Makefile",
+    "line": 3, "column": 6, "endLine": 3, "endColumn": 13,
+    "replacement": "$(CFLAGS)"
+  }
+}
+```
+
+The `fix` range is its own, and is usually wider than the range the diagnostic
+underlines: MK010 points at the `$C` that misleads, but the rewrite has to
+cover the whole of `$CFLAGS`. Applying the fix to the diagnostic's own range
+would corrupt the line.
+
+## Editors
+
+`--stdin-path` lints text on stdin as though it were the file saved at that
+path:
+
+```
+make-lint --stdin-path /repo/Makefile --format json --no-exec < buffer
+```
+
+That is what an editor needs to lint a buffer with unsaved edits. The path
+never has to exist — a new, never-saved file lints fine — but it still decides
+which directory `include` directives and `.make-lint.toml` are searched from,
+and it is the path reported back in the output, so diagnostics land on the
+buffer the text came from. Included files are read from disk as usual.
+
+Passing `--fix` with `--stdin-path` is an error rather than a write: the text
+linted is not the text on disk, so applying the fix would overwrite whatever
+the editor has not saved. Editors should read the `fix` ranges and apply them
+themselves.
+
+Two other things matter when driving make-lint from an editor. Exit code 1
+means findings, not failure — only 2 is an error. And `--no-exec` is worth
+considering as the default: the `$(shell ...)` oracle is careful (see below),
+but a lint on every keystroke is a different proposition from a lint in CI.
+
 ## Design notes
 
 ### Never report from an unknown
