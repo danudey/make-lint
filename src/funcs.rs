@@ -253,12 +253,23 @@ pub fn glob(base: &Path, pattern: &str) -> Vec<String> {
     let mut out: Vec<String> = current
         .iter()
         .map(|p| match p.strip_prefix(base) {
-            Ok(r) if !absolute => r.to_string_lossy().into_owned(),
-            _ => p.to_string_lossy().into_owned(),
+            // Makefiles only ever separate with '/', and the string functions
+            // that consume a wildcard result ($(dir), $(notdir), $(suffix))
+            // split on '/' too, so the platform separator must not leak out.
+            Ok(r) if !absolute => normalise_separators(&r.to_string_lossy()),
+            _ => normalise_separators(&p.to_string_lossy()),
         })
         .collect();
     out.sort();
     out
+}
+
+/// Rewrite the platform's path separator as '/'.
+///
+/// A no-op on unix; on Windows `Path::join` produces '\\', which no makefile
+/// would ever contain.
+fn normalise_separators(s: &str) -> String {
+    if std::path::MAIN_SEPARATOR == '/' { s.to_string() } else { s.replace('\\', "/") }
 }
 
 #[cfg(test)]

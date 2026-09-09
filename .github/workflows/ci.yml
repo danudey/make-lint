@@ -31,6 +31,32 @@ jobs:
       - name: Doc tests
         run: cargo test --locked --all-features --doc
 
+  # The differential suite compares the evaluator against whatever GNU Make is
+  # on PATH, and distros ship 4.2.1 (RHEL 8) through 4.4.1 (Debian 13, Arch).
+  # Only that suite runs here, from one statically linked binary reused across
+  # containers, so covering a distro costs a pull rather than a second build.
+  make-compat:
+    name: make compat
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-differential
+      - name: Build the differential tests as a static binary
+        run: |
+          cargo test --locked --all-features --test differential --no-run \
+            --target x86_64-unknown-linux-musl --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact"
+                            and .target.name == "differential") | .executable' \
+            | tail -1 > test-binary-path
+          install -D "$(cat test-binary-path)" dist/differential
+      - name: Run them against each distro's make
+        run: .github/scripts/make-compat.sh dist/differential
+
   codequality:
     name: Run clippy analysis
     runs-on: ubuntu-latest
