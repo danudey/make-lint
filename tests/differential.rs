@@ -1,5 +1,13 @@
 //! Differential test: the evaluator's variable table against real GNU Make.
 //!
+//! Unix only. Windows runners do carry GNU Make, but the comparison is built
+//! out of a POSIX shell: values are read back through `printf`, the fixtures
+//! call `uname`, `tr` and `wc`, and make is run with `PATH=/usr/bin:/bin` so
+//! the probe cannot pick up anything from the host. None of that is portable,
+//! and rebuilding it around `cmd.exe` would compare the evaluator against a
+//! make configured differently from the one it models.
+#![cfg(unix)]
+//!
 //! Every construct the evaluator models is written into a makefile, then make
 //! is asked to print each variable's *expanded* value and the two tables are
 //! compared. `make -p` is not used for this: it prints a recursive variable's
