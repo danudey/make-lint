@@ -641,7 +641,11 @@ fn a_generated_makefile_still_gets_syntax_errors() {
 // The shell oracle (phase 4)
 // ---------------------------------------------------------------------------
 
+// Tests that assert a command *resolved* need the program to exist, so they
+// are unix-only: cat, cksum and date are not on a stock Windows runner. The
+// ones asserting a command was refused run everywhere, as nothing is executed.
 #[test]
+#[cfg(unix)]
 fn an_allowlisted_command_resolves_the_value() {
     let f = Fixture::new(&[
         ("Makefile", "VER := $(shell cat VERSION)\nall:\n\t@echo $(VER)\n"),
@@ -653,6 +657,7 @@ fn an_allowlisted_command_resolves_the_value() {
 // The whole point of resolving commands: values that were opaque now take part
 // in the other checks.
 #[test]
+#[cfg(unix)]
 fn a_resolved_command_feeds_duplicate_detection() {
     let f = Fixture::new(&[
         (
@@ -742,6 +747,7 @@ fn reading_outside_the_project_is_refused() {
 }
 
 #[test]
+#[cfg(unix)]
 fn allow_command_extends_the_allowlist() {
     let f = Fixture::new(&[
         ("Makefile", "X := $(shell cksum VERSION)\nall:\n\t@echo $(X)\n"),
@@ -760,6 +766,7 @@ fn allow_command_extends_the_allowlist() {
 // A value that differs between runs is not evidence of duplication, however
 // well two variables agree at this moment.
 #[test]
+#[cfg(unix)]
 fn volatile_command_output_is_not_a_duplicate() {
     let f = Fixture::new(&[(
         "Makefile",
