@@ -722,7 +722,10 @@ mod tests {
         assert!(matches!(oracle().run("/usr/bin/uname"), Outcome::Refused(_)));
     }
 
+    // These four really execute the allowlisted programs, so they need a POSIX
+    // userland: echo, tr and basename are not on a stock Windows runner.
     #[test]
+    #[cfg(unix)]
     fn allowed_commands_actually_run() {
         let Outcome::Ran { output, .. } = oracle().run("echo hello") else {
             panic!("echo did not run");
@@ -756,6 +759,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn basename_takes_a_string_not_a_path() {
         let Outcome::Ran { output, .. } = oracle().run("basename /a/b/c.txt") else {
             panic!("basename was refused");
@@ -764,6 +768,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn stability_is_the_worst_stage_in_the_pipeline() {
         let Outcome::Ran { stability, .. } = oracle().run("echo x") else { panic!() };
         assert_eq!(stability, Deterministic);
@@ -772,6 +777,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn results_are_memoised() {
         let mut o = oracle();
         let first = o.run("echo memo");
