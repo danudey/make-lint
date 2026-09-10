@@ -40,20 +40,26 @@ impl Span {
 
 pub struct SourceFile {
     pub id: FileId,
+    /// Canonical path: how the file is looked up, and where `--fix` writes it.
     pub path: PathBuf,
+    /// The path as reported back to the caller. The same as `path` except for
+    /// an editor buffer, which is named the way the editor named it —
+    /// canonicalising that would hand back a path the editor cannot match
+    /// (`/private/var/...` on macOS, `\\?\C:\...` on Windows).
+    pub reported: PathBuf,
     pub text: String,
     line_starts: Vec<u32>,
 }
 
 impl SourceFile {
-    fn new(id: FileId, path: PathBuf, text: String) -> Self {
+    fn new(id: FileId, path: PathBuf, reported: PathBuf, text: String) -> Self {
         let mut line_starts = vec![0u32];
         for (i, b) in text.bytes().enumerate() {
             if b == b'\n' {
                 line_starts.push(i as u32 + 1);
             }
         }
-        SourceFile { id, path, text, line_starts }
+        SourceFile { id, path, reported, text, line_starts }
     }
 
     /// 0-based index of the line containing `off`.
@@ -101,12 +107,17 @@ pub struct SourceMap {
 
 impl SourceMap {
     pub fn add(&mut self, path: PathBuf, text: String) -> FileId {
+        self.add_as(path.clone(), path, text)
+    }
+
+    /// Add a file that is reported under a different path than it is keyed by.
+    pub fn add_as(&mut self, path: PathBuf, reported: PathBuf, text: String) -> FileId {
         if let Some(&id) = self.by_path.get(&path) {
             return id;
         }
         let id = FileId(self.files.len() as u32);
         self.by_path.insert(path.clone(), id);
-        self.files.push(SourceFile::new(id, path, text));
+        self.files.push(SourceFile::new(id, path, reported, text));
         id
     }
 

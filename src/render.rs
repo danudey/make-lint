@@ -65,7 +65,7 @@ pub fn text(diags: &[Diagnostic], sm: &SourceMap, style: &Style) -> String {
     for d in diags {
         let f = sm.get(d.primary.file);
         let (line, col) = f.line_col(d.primary.start);
-        let path = f.path.display().to_string();
+        let path = f.reported.display().to_string();
         let _ = writeln!(
             out,
             "{}: {}[{}]: {}",
@@ -78,7 +78,7 @@ pub fn text(diags: &[Diagnostic], sm: &SourceMap, style: &Style) -> String {
         for label in &d.secondary {
             let lf = sm.get(label.span.file);
             let (l, c) = lf.line_col(label.span.start);
-            let p = lf.path.display().to_string();
+            let p = lf.reported.display().to_string();
             let _ = writeln!(out, "  {} {p}:{l}:{c}: {}", style.dim("-->"), label.message);
             snippet(&mut out, sm, label.span, style, '-');
         }
@@ -149,7 +149,7 @@ pub fn json(diags: &[Diagnostic], sm: &SourceMap) -> String {
             ),
             quote(d.code),
             quote(d.severity.as_str()),
-            quote(&f.path.display().to_string()),
+            quote(&f.reported.display().to_string()),
             line,
             col,
             end_line,
@@ -172,7 +172,7 @@ pub fn json(diags: &[Diagnostic], sm: &SourceMap) -> String {
                     r#""endLine":{},"endColumn":{},"replacement":{}}}"#
                 ),
                 quote(&fx.description),
-                quote(&ff.path.display().to_string()),
+                quote(&ff.reported.display().to_string()),
                 fl,
                 fc,
                 fel,
@@ -191,7 +191,7 @@ pub fn json(diags: &[Diagnostic], sm: &SourceMap) -> String {
                 let _ = write!(
                     out,
                     r#"{{"file":{},"line":{},"column":{},"message":{}}}"#,
-                    quote(&lf.path.display().to_string()),
+                    quote(&lf.reported.display().to_string()),
                     ll,
                     lc,
                     quote(&l.message)
@@ -306,7 +306,7 @@ pub fn sarif(diags: &[Diagnostic], sm: &SourceMap, root: &std::path::Path) -> St
                 Some(h) => format!("{}\n{h}", d.message),
                 None => d.message.clone(),
             }),
-            quote(&sarif_uri(&f.path, root))
+            quote(&sarif_uri(&f.reported, root))
         );
         region(&mut out, sm, d.primary);
         out.push_str("}}]");
@@ -321,7 +321,7 @@ pub fn sarif(diags: &[Diagnostic], sm: &SourceMap, root: &std::path::Path) -> St
                 let _ = write!(
                     out,
                     r#"{{"physicalLocation":{{"artifactLocation":{{"uri":{}}},"#,
-                    quote(&sarif_uri(&lf.path, root))
+                    quote(&sarif_uri(&lf.reported, root))
                 );
                 region(&mut out, sm, l.span);
                 let _ = write!(out, r#"}},"message":{{"text":{}}}}}"#, quote(&l.message));

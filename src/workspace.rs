@@ -102,7 +102,9 @@ impl Workspace {
     /// from disk.
     pub fn load_root_text(&mut self, path: &Path, text: String) -> FileId {
         let key = canonical_key(path);
-        let id = self.add_parsed(key, text);
+        // Reported as the editor named it: it has to match the buffer's own
+        // path for the diagnostics to land back on it.
+        let id = self.add_parsed(key, Some(path.to_path_buf()), text);
         self.roots.push(id);
         id
     }
@@ -122,12 +124,15 @@ impl Workspace {
             }
             e
         })?;
-        Ok(self.add_parsed(key, text))
+        Ok(self.add_parsed(key, None, text))
     }
 
     /// Parse one already-read file into the workspace and queue its includes.
-    fn add_parsed(&mut self, key: PathBuf, text: String) -> FileId {
-        let id = self.sources.add(key.clone(), text);
+    /// `reported` overrides the path the file is named by in output; without
+    /// one it is named by its key.
+    fn add_parsed(&mut self, key: PathBuf, reported: Option<PathBuf>, text: String) -> FileId {
+        let reported = reported.unwrap_or_else(|| key.clone());
+        let id = self.sources.add_as(key.clone(), reported, text);
         let text = self.sources.get(id).text.clone();
         let (mut mf, diags) = parser::parse(id, &text);
         self.diags.extend(diags);

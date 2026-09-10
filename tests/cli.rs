@@ -2,7 +2,7 @@
 //! comments, output formats and `--fix` only meet each other in `main`.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{MAIN_SEPARATOR, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -277,6 +277,17 @@ fn stdin_is_linted_in_place_of_the_file_on_disk() {
     // ...and the file it names is the one the editor has open, so the
     // diagnostic lands back on the right buffer.
     assert!(out.contains(&format!(r#""file":{:?}"#, p.path("Makefile"))), "{out}");
+}
+
+#[test]
+fn a_stdin_path_is_reported_exactly_as_it_was_given() {
+    // Canonicalising it would hand the editor a path it cannot match against
+    // its own buffer: a symlinked temp dir on macOS, a `\\?\` prefix on
+    // Windows. `sub/..` stands in for both, and is the same on every platform.
+    let p = Project::new(&[("Makefile", "all: ; @true\n"), ("sub/keep", "")]);
+    let given = format!("{}{SEP}..{SEP}Makefile", p.path("sub"), SEP = MAIN_SEPARATOR);
+    let out = p.stdout_stdin(NOISY, &["--stdin-path", &given, "--format", "json"]);
+    assert!(out.contains(&format!(r#""file":{given:?}"#)), "{out}");
 }
 
 #[test]
