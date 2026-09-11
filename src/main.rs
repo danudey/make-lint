@@ -4,7 +4,7 @@ use make_lint::suppress::Suppressions;
 use make_lint::workspace::Workspace;
 use make_lint::{DEFAULT_MAKEFILES, checks, eval, fix, render, rules, shell};
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -20,6 +20,10 @@ directory. Statically resolvable `include` directives are followed.
 OPTIONS:
     -f, --file <FILE>        Makefile to lint (repeatable)
     -I, --include-dir <DIR>  Extra directory to search for includes (repeatable)
+        --stdin-path <PATH>  Lint stdin as the file that would be saved at
+                             PATH. The file need not exist; PATH fixes where
+                             its includes and config are looked for. For
+                             editors linting a buffer with unsaved edits.
         --format <FORMAT>    text (default), json, or sarif
         --fail-level <LEVEL> note, warning (default), or error
         --color <WHEN>       auto (default), always, or never
@@ -71,6 +75,8 @@ struct Args {
     allow_commands: Vec<String>,
     config_path: Option<PathBuf>,
     no_config: bool,
+    /// Lint stdin as if it were the file saved at this path.
+    stdin_path: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -89,8 +95,9 @@ fn run() -> Result<ExitCode, String> {
     // The config is looked for next to the makefile, so linting a subdirectory
     // still picks up the project's settings.
     let anchor = args
-        .files
-        .first()
+        .stdin_path
+        .as_ref()
+        .or_else(|| args.files.first())
         .and_then(|f| f.parent().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."));
     let config = match (&args.config_path, args.no_config) {
@@ -101,8 +108,16 @@ fn run() -> Result<ExitCode, String> {
     apply_config(&mut args, &config);
 
     let mut ws = Workspace::new(args.include_dirs.clone());
-    for f in &args.files {
-        ws.load_root(f).map_err(|e| format!("cannot read {}: {e}", f.display()))?;
+    if let Some(p) = &args.stdin_path {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| format!("cannot read stdin: {e}"))?;
+        ws.load_root_text(p, text);
+    } else {
+        for f in &args.files {
+            ws.load_root(f).map_err(|e| format!("cannot read {}: {e}", f.display()))?;
+        }
     }
 
     let opts = eval::Options {
@@ -224,6 +239,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         allow_commands: Vec::new(),
         config_path: None,
         no_config: false,
+        stdin_path: None,
     };
     let mut it = std::env::args().skip(1);
     let mut positional = Vec::new();
@@ -255,6 +271,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--fix" => a.apply_fixes = true,
             "--no-exec" => a.exec = Some(shell::Mode::Deny),
             "--allow-command" => a.allow_commands.push(next("--allow-command")?),
+            "--stdin-path" => a.stdin_path = Some(PathBuf::from(next("--stdin-path")?)),
             "--config" => a.config_path = Some(PathBuf::from(next("--config")?)),
             "--no-config" => a.no_config = true,
             "--format" => {
@@ -285,7 +302,20 @@ fn parse_args() -> Result<Option<Args>, String> {
     }
 
     a.files.extend(positional);
-    if a.files.is_empty() {
+    if a.stdin_path.is_some() {
+        if !a.files.is_empty() {
+            return Err(
+                "--stdin-path already says which file stdin is; do not also name one".into()
+            );
+        }
+        if a.apply_fixes {
+            // The file on disk is not what was linted, so writing to it would
+            // clobber whatever the editor has not saved yet.
+            return Err("--fix cannot write a file whose text came from stdin; \
+                 read the `fix` ranges from --format json and apply them instead"
+                .into());
+        }
+    } else if a.files.is_empty() {
         let found = DEFAULT_MAKEFILES
             .iter()
             .map(PathBuf::from)

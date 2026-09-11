@@ -95,8 +95,22 @@ impl Workspace {
         Ok(id)
     }
 
+    /// Load a root whose text came from somewhere other than the file itself —
+    /// an editor buffer with unsaved edits. `path` is where that buffer would
+    /// be saved: it never has to exist, but it fixes the directory the
+    /// buffer's `include` directives resolve against, and those are still read
+    /// from disk.
+    pub fn load_root_text(&mut self, path: &Path, text: String) -> FileId {
+        let key = canonical_key(path);
+        // Reported as the editor named it: it has to match the buffer's own
+        // path for the diagnostics to land back on it.
+        let id = self.add_parsed(key, Some(path.to_path_buf()), text);
+        self.roots.push(id);
+        id
+    }
+
     fn load(&mut self, path: &Path, from: Option<Span>) -> Result<FileId, std::io::Error> {
-        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let key = canonical_key(path);
         if let Some(id) = self.sources.find(&key) {
             return Ok(id);
         }
@@ -110,8 +124,15 @@ impl Workspace {
             }
             e
         })?;
+        Ok(self.add_parsed(key, None, text))
+    }
 
-        let id = self.sources.add(key.clone(), text);
+    /// Parse one already-read file into the workspace and queue its includes.
+    /// `reported` overrides the path the file is named by in output; without
+    /// one it is named by its key.
+    fn add_parsed(&mut self, key: PathBuf, reported: Option<PathBuf>, text: String) -> FileId {
+        let reported = reported.unwrap_or_else(|| key.clone());
+        let id = self.sources.add_as(key.clone(), reported, text);
         let text = self.sources.get(id).text.clone();
         let (mut mf, diags) = parser::parse(id, &text);
         self.diags.extend(diags);
@@ -134,7 +155,20 @@ impl Workspace {
         for (p, span) in queue {
             let _ = self.load(&p, Some(span));
         }
-        Ok(id)
+        id
+    }
+}
+
+/// The key a file is stored under in the source map. Canonical where the file
+/// exists; otherwise absolute, since an unsaved buffer still needs its
+/// includes resolved from the directory it will be saved in.
+fn canonical_key(path: &Path) -> PathBuf {
+    if let Ok(p) = std::fs::canonicalize(path) {
+        return p;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
     }
 }
 
