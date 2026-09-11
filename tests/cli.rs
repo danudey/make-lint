@@ -52,7 +52,14 @@ impl Project {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn make-lint");
-        child.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
+        // A run that rejects its arguments exits before it reads stdin, so the
+        // write races the exit: losing that race is a broken pipe, not a
+        // failure. The tests that expect the buffer to be read assert on it.
+        let mut stdin = child.stdin.take().unwrap();
+        if let Err(e) = stdin.write_all(body.as_bytes()) {
+            assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "write to stdin: {e}");
+        }
+        drop(stdin);
         child.wait_with_output().expect("run make-lint")
     }
 
